@@ -1,0 +1,9 @@
+//! Integración con Linux/freedesktop: rutas XDG, archivos, lanzadores, registro.
+
+pub mod desktop_entry;
+pub mod icons;
+pub mod launch;
+pub mod log;
+pub mod paths;
+pub mod scan;
+pub mod store;
