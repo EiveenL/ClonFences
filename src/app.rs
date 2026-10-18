@@ -3,7 +3,6 @@
 //! y la región de entrada se limita a sus rectángulos, así el resto de clics llegan al escritorio de abajo.
 //! Mientras hay un menú abierto o se arrastra un elemento, la superficie acepta toda la entrada.
 
-use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -13,7 +12,6 @@ use cosmic::app::{Core, Task};
 use cosmic::cctk::wayland_client::Proxy;
 use cosmic::cctk::wayland_client::protocol::wl_output::WlOutput;
 use cosmic::iced::clipboard::dnd::DndAction;
-use cosmic::iced::clipboard::mime::AllowedMimeTypes;
 use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::event::wayland::{Event as WaylandEvent, OutputEvent};
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::{
@@ -46,23 +44,6 @@ const MENU_WIDTH: f32 = 230.0;
 const MENU_ITEM_HEIGHT: f32 = 36.0;
 
 static RENAME_INPUT: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("clonfences-rename"));
-
-/// Archivos que llegan arrastrados desde otra aplicación (el escritorio de COSMIC, Archivos…).
-#[derive(Debug, Clone)]
-struct DroppedPaths(Vec<PathBuf>);
-
-impl AllowedMimeTypes for DroppedPaths {
-    fn allowed() -> Cow<'static, [String]> {
-        Cow::Owned(vec!["text/uri-list".to_string()])
-    }
-}
-
-impl TryFrom<(Vec<u8>, String)> for DroppedPaths {
-    type Error = std::str::Utf8Error;
-    fn try_from((data, _mime): (Vec<u8>, String)) -> Result<Self, Self::Error> {
-        Ok(Self(crate::model::uri::parse_uri_list(std::str::from_utf8(&data)?)))
-    }
-}
 
 pub struct Flags {
     pub config: AppConfig,
@@ -159,10 +140,11 @@ pub enum Message {
     CloseMenu,
     RenameInput(String),
     RenameSubmit,
-    /// Un arrastre externo entra en un fence (Some) o sale (None).
-    DndHover(Option<String>),
-    /// Se soltaron archivos de otra aplicación sobre un fence.
-    DropFiles(String, Vec<PathBuf>),
+    /// Un arrastre de otra aplicación se mueve sobre la superficie.
+    DndMotion(window::Id, Point),
+    DndLeave,
+    /// Se soltaron archivos de otra aplicación en este punto de la superficie.
+    DropFiles(window::Id, Point, Vec<PathBuf>),
     Escape,
     Tick,
     /// SIGINT/SIGTERM/SIGHUP: restaurar el escritorio, guardar y salir.
@@ -332,10 +314,21 @@ impl Application for App {
             }
             Message::RenameSubmit => self.commit_rename(),
 
-            Message::DndHover(fid) => self.dnd_hover = fid,
-            Message::DropFiles(fid, paths) => {
+            Message::DndMotion(surface, p) => {
+                let hover = self.fence_at(surface, p).filter(|f| !f.is_portal()).map(|f| f.id.clone());
+                if hover.is_some() && hover != self.dnd_hover {
+                    log(format!("Arrastre externo sobre un fence en ({:.0}, {:.0})", p.x, p.y));
+                }
+                self.dnd_hover = hover;
+            }
+            Message::DndLeave => self.dnd_hover = None,
+            Message::DropFiles(surface, p, paths) => {
                 self.dnd_hover = None;
-                self.add_to_fence(&fid, paths);
+                let target = self.fence_at(surface, p).map(|f| f.id.clone());
+                log(format!("Soltados {} elementos en ({:.0}, {:.0}) → {target:?}", paths.len(), p.x, p.y));
+                if let Some(fid) = target {
+                    self.add_to_fence(&fid, paths);
+                }
             }
 
             Message::Escape => {
@@ -379,7 +372,7 @@ impl Application for App {
         };
         let mut layers: Vec<Element<'_, Message>> = self
             .fences_on(screen)
-            .map(|f| pin(self.droppable(f)).x(f.x as f32).y(f.y as f32).into())
+            .map(|f| pin(self.fence_view(f)).x(f.x as f32).y(f.y as f32).into())
             .collect();
         if let Some(ghost) = self.drag_ghost(id) {
             layers.push(ghost);
@@ -387,7 +380,23 @@ impl Application for App {
         if let Some(menu) = self.menu.as_ref().filter(|m| m.surface == id) {
             layers.extend(self.menu_layers(menu, screen));
         }
-        stack(layers).width(Length::Fill).height(Length::Fill).into()
+        let content = stack(layers).width(Length::Fill).height(Length::Fill);
+
+        // Una sola zona de soltar para toda la superficie: `pin` no propaga las zonas de soltar de sus
+        // hijos, así que el fence de destino se calcula a partir del punto. La región de entrada ya
+        // limita los arrastres externos a los rectángulos de los fences.
+        widget::dnd_destination(content, vec!["text/uri-list".into()])
+            // Sólo "copiar": el fence guarda una referencia y el origen no debe mover ni borrar nada.
+            .action(DndAction::Copy)
+            .preferred_action(DndAction::Copy)
+            .on_enter(move |x, y, _| Message::DndMotion(id, Point::new(x as f32, y as f32)))
+            .on_motion(move |x, y| Message::DndMotion(id, Point::new(x as f32, y as f32)))
+            .on_leave(|| Message::DndLeave)
+            .on_finish(move |_mime, data, _action, x, y| {
+                let paths = std::str::from_utf8(&data).map(crate::model::uri::parse_uri_list).unwrap_or_default();
+                Message::DropFiles(id, Point::new(x as f32, y as f32), paths)
+            })
+            .into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -1097,23 +1106,6 @@ impl App {
         .on_right_press(Message::HeaderRightPressed(f.id.clone()))
         .on_double_click(Message::ToggleRolled(f.id.clone()))
         .interaction(if fixed { mouse::Interaction::Idle } else { mouse::Interaction::Grab })
-        .into()
-    }
-
-    /// El fence acepta archivos arrastrados desde otras aplicaciones (sólo los fences normales).
-    fn droppable<'a>(&'a self, f: &'a FenceModel) -> Element<'a, Message> {
-        if f.is_portal() {
-            return self.fence_view(f);
-        }
-        let (drop_id, enter_id) = (f.id.clone(), f.id.clone());
-        widget::DndDestination::for_data::<DroppedPaths>(self.fence_view(f), move |data, _action| {
-            Message::DropFiles(drop_id.clone(), data.map(|d| d.0).unwrap_or_default())
-        })
-        // Sólo "copiar": el fence guarda una referencia y el origen no debe borrar ni mover nada.
-        .action(DndAction::Copy)
-        .preferred_action(DndAction::Copy)
-        .on_enter(move |_, _, _| Message::DndHover(Some(enter_id.clone())))
-        .on_leave(|| Message::DndHover(None))
         .into()
     }
 
