@@ -98,6 +98,12 @@ pub struct AppSettings {
     pub default_color: String,
     pub default_opacity: f64,
     pub first_run: bool,
+
+    /// Sólo Linux: ocultar del escritorio de COSMIC (vía `~/Escritorio/.hidden`) lo que ya está en un fence.
+    pub hide_fenced_items: bool,
+    /// Sólo Linux: nombres que la app añadió a `.hidden` (para quitarlos al salir sin tocar los del usuario).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub hidden_on_desktop: Vec<String>,
 }
 
 impl Default for AppSettings {
@@ -116,6 +122,8 @@ impl Default for AppSettings {
             default_color: "#1E1E1E".into(),
             default_opacity: 0.45,
             first_run: true,
+            hide_fenced_items: true,
+            hidden_on_desktop: Vec::new(),
         }
     }
 }

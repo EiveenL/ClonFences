@@ -11,6 +11,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 mime_guess = "2"
+tokio = { version = "1", features = ["signal", "macros"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 
 [dependencies.libcosmic]

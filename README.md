@@ -38,6 +38,9 @@ Explorer, posicionar ventanas en coordenadas absolutas). Aquí se usa el protoco
 
 ## Datos
 
+- Lo que está en un fence se oculta del escritorio de COSMIC añadiéndolo a `~/Escritorio/.hidden` (el estándar que
+  respetan cosmic-files y Nautilus). Al salir se quitan esas líneas; las que haya puesto el usuario no se tocan.
+  `clonfences --restore` las quita sin abrir la app (por si se cerró de golpe).
 - Configuración: `~/.config/ClonFences/config.json` (registro en `log.txt`). Otra carpeta: variable `CLONFENCES_DATA`.
 - El formato es el mismo que el de Windows (`%APPDATA%\ClonFences\config.json`). Si se copia una configuración de Windows,
   las rutas `C:\…\Escritorio\archivo` se reasignan a `~/Escritorio/archivo` cuando ese archivo existe.

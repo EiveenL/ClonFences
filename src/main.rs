@@ -11,7 +11,11 @@ use platform::{log::log, paths, store};
 fn main() -> cosmic::iced::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("Uso: clonfences [--reset]\n  --reset  aparta la configuración actual (config.json.bak) y empieza de cero");
+        println!(
+            "Uso: clonfences [--reset | --restore]\n  \
+             --reset    aparta la configuración actual (config.json.bak) y empieza de cero\n  \
+             --restore  vuelve a mostrar en el escritorio de COSMIC lo que la app ocultó, y sale"
+        );
         return Ok(());
     }
 
@@ -31,7 +35,23 @@ fn main() -> cosmic::iced::Result {
         }
     }
 
-    let config = store::load();
+    let mut config = store::load();
+
+    if args.iter().any(|a| a == "--restore") {
+        let desktop = paths::desktop_dir();
+        match platform::hidden::sync(&desktop, &Default::default(), &config.settings.hidden_on_desktop) {
+            Ok(_) => {
+                config.settings.hidden_on_desktop.clear();
+                if let Err(e) = store::save(&config) {
+                    eprintln!("No se pudo guardar la configuración: {e}");
+                }
+                println!("Elementos del escritorio restaurados.");
+            }
+            Err(e) => eprintln!("No se pudo actualizar {}/.hidden: {e}", desktop.display()),
+        }
+        return Ok(());
+    }
+
     let settings = cosmic::app::Settings::default()
         .no_main_window(true)
         .transparent(true)

@@ -2,7 +2,7 @@
 //! en la capa `Bottom` (encima del fondo, debajo de las ventanas). Los fences se dibujan dentro de ella
 //! y la región de entrada se limita a sus rectángulos, así el resto de clics llegan al escritorio de abajo.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -30,7 +30,7 @@ use crate::model::config::{AppConfig, FenceModel, new_id};
 use crate::model::geometry::{self, Edges, HEADER_HEIGHT, Rect};
 use crate::model::item::{FenceItem, sort_items};
 use crate::platform::icons::{IconSpec, icon_for};
-use crate::platform::{launch, log::log, paths, scan, store};
+use crate::platform::{hidden, launch, log::log, paths, scan, store};
 
 /// Grosor de la zona sensible de los bordes para redimensionar.
 const GRIP: f32 = 6.0;
@@ -89,6 +89,8 @@ pub enum Message {
     Open(PathBuf),
     Escape,
     Tick,
+    /// SIGINT/SIGTERM/SIGHUP: restaurar el escritorio, guardar y salir.
+    Quit,
 }
 
 pub struct App {
@@ -103,6 +105,8 @@ pub struct App {
     /// Última fecha de modificación vista de cada carpeta vigilada (escritorio y portales).
     dir_stamps: HashMap<PathBuf, Option<SystemTime>>,
     save_due: Option<Instant>,
+    /// Último conjunto de nombres aplicado a `~/Escritorio/.hidden` (None = volver a comprobar).
+    hidden_synced: Option<BTreeSet<String>>,
 }
 
 impl Application for App {
@@ -131,6 +135,7 @@ impl Application for App {
             selected: None,
             dir_stamps: HashMap::new(),
             save_due: None,
+            hidden_synced: None,
         };
         app.dir_stamps.insert(app.desktop.clone(), scan::dir_stamp(&app.desktop));
         let ids: Vec<String> = app.config.fences.iter().map(|f| f.id.clone()).collect();
@@ -198,12 +203,21 @@ impl Application for App {
             Message::Tick => {
                 let mut task = Task::none();
                 if self.refresh_changed_dirs() {
+                    self.hidden_synced = None;
                     task = self.sync_regions();
                 }
+                self.sync_hidden(true);
                 if self.save_due.is_some_and(|t| Instant::now() >= t) {
                     self.save_now();
                 }
                 return task;
+            }
+
+            Message::Quit => {
+                log("Saliendo");
+                self.sync_hidden(false);
+                self.save_now();
+                return iced::exit();
             }
         }
         Task::none()
@@ -244,13 +258,36 @@ impl Application for App {
                 _ => None,
             }),
             iced::time::every(Duration::from_secs(1)).map(|_| Message::Tick),
+            Subscription::run(quit_signals),
         ])
     }
 
     fn on_app_exit(&mut self) -> Option<Message> {
+        self.sync_hidden(false);
         self.save_now();
         None
     }
+}
+
+/// Emite `Message::Quit` al recibir SIGINT (Ctrl+C), SIGTERM (cierre de sesión) o SIGHUP.
+fn quit_signals() -> impl cosmic::iced::futures::Stream<Item = Message> {
+    cosmic::iced::stream::channel(1, |mut tx: cosmic::iced::futures::channel::mpsc::Sender<Message>| async move {
+        use cosmic::iced::futures::SinkExt;
+        use tokio::signal::unix::{SignalKind, signal};
+        let (Ok(mut int), Ok(mut term), Ok(mut hup)) =
+            (signal(SignalKind::interrupt()), signal(SignalKind::terminate()), signal(SignalKind::hangup()))
+        else {
+            log("No se pudieron instalar los manejadores de señales");
+            return;
+        };
+        tokio::select! {
+            _ = int.recv() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+        let _ = tx.send(Message::Quit).await;
+        std::future::pending::<()>().await;
+    })
 }
 
 impl App {
@@ -581,6 +618,30 @@ impl App {
         self.reload_fence(&id);
         log("Primer arranque: creado el fence «Escritorio»");
         self.save_soon();
+    }
+
+    // ───────────────────────────── Escritorio de COSMIC ─────────────────────────────
+
+    /// Oculta del escritorio de COSMIC lo que está en un fence (`enabled = false` lo devuelve todo).
+    fn sync_hidden(&mut self, enabled: bool) {
+        let want = if enabled && self.config.settings.hide_fenced_items {
+            hidden::fenced_names(&self.config, &self.desktop)
+        } else {
+            BTreeSet::new()
+        };
+        if self.hidden_synced.as_ref() == Some(&want) {
+            return;
+        }
+        match hidden::sync(&self.desktop, &want, &self.config.settings.hidden_on_desktop) {
+            Ok(managed) => {
+                if managed != self.config.settings.hidden_on_desktop {
+                    self.config.settings.hidden_on_desktop = managed;
+                    self.save_soon();
+                }
+                self.hidden_synced = Some(want);
+            }
+            Err(e) => log(format!("No se pudo actualizar {}/.hidden: {e}", self.desktop.display())),
+        }
     }
 
     // ───────────────────────────── Guardado ─────────────────────────────
