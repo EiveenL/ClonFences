@@ -1,14 +1,17 @@
 //! Aplicación COSMIC: una superficie layer-shell transparente a pantalla completa por monitor,
 //! en la capa `Bottom` (encima del fondo, debajo de las ventanas). Los fences se dibujan dentro de ella
 //! y la región de entrada se limita a sus rectángulos, así el resto de clics llegan al escritorio de abajo.
+//! Mientras hay un menú abierto o se arrastra un elemento, la superficie acepta toda la entrada.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{Duration, Instant, SystemTime};
 
 use cosmic::app::{Core, Task};
 use cosmic::cctk::wayland_client::Proxy;
 use cosmic::cctk::wayland_client::protocol::wl_output::WlOutput;
+use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::event::wayland::{Event as WaylandEvent, OutputEvent};
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::{
     IcedMargin, IcedOutput, SctkLayerSurfaceSettings,
@@ -19,7 +22,6 @@ use cosmic::iced::platform_specific::shell::wayland::commands::layer_surface::{
 };
 use cosmic::iced::widget::{pin, stack};
 use cosmic::iced::{self, Alignment, Background, Border, Color, Event, Length, Limits, Point, Rectangle, Subscription};
-use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::{event, keyboard, mouse, window};
 use cosmic::widget::icon::{self, IconFallback};
 use cosmic::widget::{self, container};
@@ -35,6 +37,12 @@ use crate::platform::{hidden, launch, log::log, paths, scan, store};
 /// Grosor de la zona sensible de los bordes para redimensionar.
 const GRIP: f32 = 6.0;
 const SAVE_DELAY: Duration = Duration::from_millis(800);
+/// Distancia que hay que mover el ratón con el botón pulsado para empezar a arrastrar un elemento.
+const DRAG_THRESHOLD: f32 = 6.0;
+const MENU_WIDTH: f32 = 230.0;
+const MENU_ITEM_HEIGHT: f32 = 36.0;
+
+static RENAME_INPUT: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("clonfences-rename"));
 
 pub struct Flags {
     pub config: AppConfig,
@@ -68,12 +76,50 @@ enum Grab {
     Resize(Edges),
 }
 
+/// Mover o redimensionar un fence.
 struct Drag {
     fence: String,
     grab: Grab,
     surface: window::Id,
     origin: Point,
     start: Rect,
+}
+
+/// Arrastrar un elemento fuera del fence o a otro fence.
+struct ItemDrag {
+    from: String,
+    path: PathBuf,
+    surface: window::Id,
+    origin: Point,
+    pos: Point,
+    /// Pasa a true al superar `DRAG_THRESHOLD` (antes es un clic normal).
+    active: bool,
+}
+
+#[derive(Debug, Clone)]
+enum MenuTarget {
+    Fence(String),
+    Item(String, PathBuf),
+}
+
+struct Menu {
+    surface: window::Id,
+    at: Point,
+    target: MenuTarget,
+}
+
+#[derive(Debug, Clone)]
+pub enum MenuAction {
+    Rename(String),
+    ToggleRolled(String),
+    ToggleLocked(String),
+    Open(PathBuf),
+    RemoveFromFence(String, PathBuf),
+}
+
+struct Rename {
+    fence: String,
+    text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -83,10 +129,16 @@ pub enum Message {
     CursorMoved(window::Id, Point),
     LeftReleased,
     HeaderPressed(String),
+    HeaderRightPressed(String),
     ResizePressed(String, Edges),
     ToggleRolled(String),
-    Select(PathBuf),
+    ItemPressed(String, PathBuf),
+    ItemRightPressed(String, PathBuf),
     Open(PathBuf),
+    Menu(MenuAction),
+    CloseMenu,
+    RenameInput(String),
+    RenameSubmit,
     Escape,
     Tick,
     /// SIGINT/SIGTERM/SIGHUP: restaurar el escritorio, guardar y salir.
@@ -100,8 +152,13 @@ pub struct App {
     screens: Vec<Screen>,
     entries: HashMap<String, Vec<Entry>>,
     drag: Option<Drag>,
+    item_drag: Option<ItemDrag>,
+    menu: Option<Menu>,
+    renaming: Option<Rename>,
     cursor: HashMap<window::Id, Point>,
     selected: Option<PathBuf>,
+    /// Entradas del escritorio ya vistas: sólo las nuevas se añaden solas a un fence.
+    desktop_known: HashSet<PathBuf>,
     /// Última fecha de modificación vista de cada carpeta vigilada (escritorio y portales).
     dir_stamps: HashMap<PathBuf, Option<SystemTime>>,
     save_due: Option<Instant>,
@@ -124,13 +181,18 @@ impl Application for App {
     }
 
     fn init(core: Core, flags: Flags) -> (Self, Task<Message>) {
+        let desktop = paths::desktop_dir();
         let mut app = App {
             core,
             config: flags.config,
-            desktop: paths::desktop_dir(),
+            desktop_known: scan::list_dir(&desktop).into_iter().collect(),
+            desktop,
             screens: Vec::new(),
             entries: HashMap::new(),
             drag: None,
+            item_drag: None,
+            menu: None,
+            renaming: None,
             cursor: HashMap::new(),
             selected: None,
             dir_stamps: HashMap::new(),
@@ -165,40 +227,90 @@ impl Application for App {
 
             Message::CursorMoved(id, p) => {
                 self.cursor.insert(id, p);
-                if let Some(drag) = &self.drag
-                    && drag.surface == id
-                {
+                if let Some(d) = self.item_drag.as_mut().filter(|d| d.surface == id) {
+                    d.pos = p;
+                    if !d.active && p.distance(d.origin) > DRAG_THRESHOLD {
+                        d.active = true;
+                        // Aceptar toda la entrada para seguir el arrastre fuera de los fences.
+                        return self.sync_regions();
+                    }
+                } else if self.drag.as_ref().is_some_and(|d| d.surface == id) {
                     self.drag_to(p);
                 }
             }
 
             Message::LeftReleased => {
+                if let Some(d) = self.item_drag.take() {
+                    if d.active {
+                        self.drop_item(d);
+                    }
+                    return self.sync_regions();
+                }
                 if self.drag.take().is_some() {
                     self.save_soon();
                     return self.sync_regions();
                 }
             }
 
-            Message::HeaderPressed(fid) => self.begin_drag(&fid, Grab::Move),
-            Message::ResizePressed(fid, edges) => self.begin_drag(&fid, Grab::Resize(edges)),
+            Message::HeaderPressed(fid) => {
+                self.commit_rename();
+                self.begin_drag(&fid, Grab::Move);
+            }
+            Message::HeaderRightPressed(fid) => {
+                self.commit_rename();
+                return self.open_menu(&fid, MenuTarget::Fence(fid.clone()));
+            }
+            Message::ResizePressed(fid, edges) => {
+                self.commit_rename();
+                self.begin_drag(&fid, Grab::Resize(edges));
+            }
 
             Message::ToggleRolled(fid) => {
                 self.drag = None;
-                if let Some(f) = self.config.fence_mut(&fid) {
-                    f.rolled_up = !f.rolled_up;
-                    self.save_soon();
-                    return self.sync_regions();
-                }
+                return self.toggle_rolled(&fid);
             }
 
-            Message::Select(path) => self.selected = Some(path),
+            Message::ItemPressed(fid, path) => {
+                self.commit_rename();
+                self.selected = Some(path.clone());
+                self.arm_item_drag(&fid, path);
+            }
+            Message::ItemRightPressed(fid, path) => {
+                self.commit_rename();
+                self.selected = Some(path.clone());
+                return self.open_menu(&fid, MenuTarget::Item(fid.clone(), path));
+            }
 
             Message::Open(path) => {
+                self.item_drag = None;
                 self.selected = Some(path.clone());
                 launch::open(&path);
             }
 
-            Message::Escape => self.selected = None,
+            Message::Menu(action) => {
+                self.menu = None;
+                let task = self.run_menu_action(action);
+                return Task::batch([task, self.sync_regions()]);
+            }
+            Message::CloseMenu => {
+                if self.menu.take().is_some() {
+                    return self.sync_regions();
+                }
+            }
+
+            Message::RenameInput(text) => {
+                if let Some(r) = &mut self.renaming {
+                    r.text = text;
+                }
+            }
+            Message::RenameSubmit => self.commit_rename(),
+
+            Message::Escape => {
+                if self.renaming.take().is_none() && self.menu.take().is_none() {
+                    self.selected = None;
+                }
+                return self.sync_regions();
+            }
 
             Message::Tick => {
                 let mut task = Task::none();
@@ -232,16 +344,22 @@ impl Application for App {
         let Some(screen) = self.screens.iter().find(|s| s.surface == id) else {
             return widget::space::horizontal().into();
         };
-        let layers: Vec<Element<'_, Message>> = self
+        let mut layers: Vec<Element<'_, Message>> = self
             .fences_on(screen)
             .map(|f| pin(self.fence_view(f)).x(f.x as f32).y(f.y as f32).into())
             .collect();
+        if let Some(ghost) = self.drag_ghost(id) {
+            layers.push(ghost);
+        }
+        if let Some(menu) = self.menu.as_ref().filter(|m| m.surface == id) {
+            layers.extend(self.menu_layers(menu, screen));
+        }
         stack(layers).width(Length::Fill).height(Length::Fill).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
         Subscription::batch([
-            event::listen_with(|event, status, id| match event {
+            event::listen_with(|event, _status, id| match event {
                 Event::Mouse(mouse::Event::CursorMoved { position }) => Some(Message::CursorMoved(id, position)),
                 Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Some(Message::LeftReleased),
                 Event::Window(window::Event::Resized(size)) => Some(Message::SurfaceSize(id, size.width, size.height)),
@@ -251,7 +369,7 @@ impl Application for App {
                 Event::Keyboard(keyboard::Event::KeyPressed {
                     key: keyboard::Key::Named(keyboard::key::Named::Escape),
                     ..
-                }) if status == event::Status::Ignored => Some(Message::Escape),
+                }) => Some(Message::Escape),
                 Event::PlatformSpecific(event::PlatformSpecific::Wayland(WaylandEvent::Output(ev, output))) => {
                     Some(Message::Output(ev, output))
                 }
@@ -303,10 +421,7 @@ impl App {
                     .as_ref()
                     .and_then(|i| i.name.clone())
                     .unwrap_or_else(|| format!("output-{}", output.id().protocol_id()));
-                let (width, height) = info
-                    .as_ref()
-                    .and_then(|i| i.logical_size)
-                    .unwrap_or((0, 0));
+                let (width, height) = info.as_ref().and_then(|i| i.logical_size).unwrap_or((0, 0));
                 let surface = window::Id::unique();
                 log(format!("Monitor {name}: {width}x{height}"));
                 self.screens.push(Screen { surface, output: output.clone(), name, width, height });
@@ -338,6 +453,9 @@ impl App {
                 };
                 let s = self.screens.remove(pos);
                 log(format!("Monitor {} desconectado", s.name));
+                if self.menu.as_ref().is_some_and(|m| m.surface == s.surface) {
+                    self.menu = None;
+                }
                 // Sus fences pasan al primer monitor que quede (sin cambiar su `output`, por si vuelve).
                 self.clamp_fences();
                 Task::batch([destroy_layer_surface(s.surface), self.sync_regions()])
@@ -361,6 +479,11 @@ impl App {
             .or(if self.screens.is_empty() { None } else { Some(0) })
     }
 
+    fn surface_of(&self, fid: &str) -> Option<window::Id> {
+        let f = self.config.fence(fid)?;
+        self.screen_index_of(f).map(|i| self.screens[i].surface)
+    }
+
     fn fences_on<'a>(&'a self, screen: &'a Screen) -> impl Iterator<Item = &'a FenceModel> + 'a {
         self.config
             .fences
@@ -370,6 +493,19 @@ impl App {
 
     fn visible_rect(f: &FenceModel) -> Rect {
         Rect::new(f.x, f.y, f.width, if f.rolled_up { HEADER_HEIGHT } else { f.height })
+    }
+
+    /// Fence bajo un punto de una superficie (el de más arriba si se solapan).
+    fn fence_at(&self, surface: window::Id, p: Point) -> Option<&FenceModel> {
+        let screen = self.screens.iter().find(|s| s.surface == surface)?;
+        let (x, y) = (p.x.round() as i32, p.y.round() as i32);
+        self.fences_on(screen).filter(|f| Self::visible_rect(f).contains(x, y)).last()
+    }
+
+    /// ¿Esta superficie debe aceptar toda la entrada (menú abierto o arrastrando un elemento)?
+    fn wants_full_input(&self, surface: window::Id) -> bool {
+        self.menu.as_ref().is_some_and(|m| m.surface == surface)
+            || self.item_drag.as_ref().is_some_and(|d| d.active && d.surface == surface)
     }
 
     /// Región de entrada y de desenfoque de cada monitor = rectángulos de sus fences.
@@ -385,7 +521,8 @@ impl App {
                 .collect();
             let blur_zone = self.config.settings.blur_behind.then(|| rects.clone());
             tasks.push(blur(s.surface, blur_zone).discard());
-            tasks.push(set_input_zone(s.surface, Some(rects)));
+            let input = if self.wants_full_input(s.surface) { None } else { Some(rects) };
+            tasks.push(set_input_zone(s.surface, input));
         }
         Task::batch(tasks)
     }
@@ -405,7 +542,7 @@ impl App {
         }
     }
 
-    // ───────────────────────────── Mover / redimensionar ─────────────────────────────
+    // ───────────────────────────── Mover / redimensionar fences ─────────────────────────────
 
     fn begin_drag(&mut self, fid: &str, grab: Grab) {
         if self.config.settings.lock_all {
@@ -415,8 +552,7 @@ impl App {
         if f.locked {
             return;
         }
-        let Some(i) = self.screen_index_of(f) else { return };
-        let surface = self.screens[i].surface;
+        let Some(surface) = self.surface_of(fid) else { return };
         let Some(origin) = self.cursor.get(&surface).copied() else { return };
         self.drag = Some(Drag {
             fence: fid.to_string(),
@@ -437,6 +573,7 @@ impl App {
             self.fences_on(screen).filter(|o| o.id != drag.fence).map(Self::visible_rect).collect();
         let (dx, dy) = ((p.x - drag.origin.x).round() as i32, (p.y - drag.origin.y).round() as i32);
         let snap = self.config.settings.snap_enabled;
+        let resizing = matches!(drag.grab, Grab::Resize(_));
         let r = match drag.grab {
             Grab::Move => {
                 let visible_h = if f.rolled_up { HEADER_HEIGHT } else { drag.start.h };
@@ -448,11 +585,210 @@ impl App {
         let fid = drag.fence.clone();
         if let Some(f) = self.config.fence_mut(&fid) {
             (f.x, f.y, f.width) = (r.x, r.y, r.w);
-            if !(f.rolled_up && matches!(self.drag.as_ref().map(|d| d.grab), Some(Grab::Resize(_)))) {
+            // Un fence enrollado sólo cambia de ancho al redimensionar: conserva su altura desplegada.
+            if !(f.rolled_up && resizing) {
                 f.height = r.h;
             }
             f.output = Some(name);
         }
+    }
+
+    fn toggle_rolled(&mut self, fid: &str) -> Task<Message> {
+        if let Some(f) = self.config.fence_mut(fid) {
+            f.rolled_up = !f.rolled_up;
+            self.save_soon();
+        }
+        self.sync_regions()
+    }
+
+    // ───────────────────────────── Arrastrar elementos ─────────────────────────────
+
+    fn arm_item_drag(&mut self, fid: &str, path: PathBuf) {
+        let Some(f) = self.config.fence(fid) else { return };
+        // Los portales muestran una carpeta: sus elementos no se "sacan".
+        if f.is_portal() {
+            return;
+        }
+        let Some(surface) = self.surface_of(fid) else { return };
+        let Some(origin) = self.cursor.get(&surface).copied() else { return };
+        self.item_drag = Some(ItemDrag { from: fid.to_string(), path, surface, origin, pos: origin, active: false });
+    }
+
+    /// Fence normal sobre el que se soltaría el elemento ahora mismo (distinto del de origen).
+    fn drop_target(&self) -> Option<&FenceModel> {
+        let d = self.item_drag.as_ref().filter(|d| d.active)?;
+        self.fence_at(d.surface, d.pos).filter(|f| f.id != d.from && !f.is_portal())
+    }
+
+    fn drop_item(&mut self, d: ItemDrag) {
+        let target = self.fence_at(d.surface, d.pos).map(|f| (f.id.clone(), f.is_portal()));
+        match target {
+            // Sobre el escritorio: sale del fence y vuelve a verse en el escritorio de COSMIC.
+            None => self.remove_from_fence(&d.from, &d.path),
+            Some((tid, false)) if tid != d.from => self.move_to_fence(&d.path, &tid),
+            _ => {}
+        }
+    }
+
+    fn remove_from_fence(&mut self, fid: &str, path: &Path) {
+        let key = path.to_string_lossy();
+        if let Some(f) = self.config.fence_mut(fid) {
+            f.items.retain(|p| *p != key);
+        }
+        if self.selected.as_deref() == Some(path) {
+            self.selected = None;
+        }
+        self.reload_fence(fid);
+        self.save_soon();
+        self.sync_hidden(true);
+    }
+
+    fn move_to_fence(&mut self, path: &Path, target: &str) {
+        let key = path.to_string_lossy().into_owned();
+        let mut touched = Vec::new();
+        for f in self.config.fences.iter_mut().filter(|f| !f.is_portal()) {
+            let before = f.items.len();
+            f.items.retain(|p| *p != key);
+            if f.items.len() != before {
+                touched.push(f.id.clone());
+            }
+        }
+        if let Some(t) = self.config.fence_mut(target) {
+            t.items.push(key);
+            touched.push(target.to_string());
+        }
+        for id in touched {
+            self.reload_fence(&id);
+        }
+        self.save_soon();
+        self.sync_hidden(true);
+    }
+
+    fn drag_ghost(&self, surface: window::Id) -> Option<Element<'_, Message>> {
+        let d = self.item_drag.as_ref().filter(|d| d.active && d.surface == surface)?;
+        let f = self.config.fence(&d.from)?;
+        let entry = self.entries.get(&d.from)?.iter().find(|e| e.item.path == d.path)?;
+        let size = self.icon_size(f);
+        let w = size as f32 + 42.0;
+        let content = widget::column::with_capacity(2)
+            .push(widget::icon(entry.icon.clone()).size(size))
+            .push(
+                widget::text(entry.item.name.as_str())
+                    .size(12)
+                    .width(Length::Fill)
+                    .align_x(Alignment::Center)
+                    .class(cosmic::theme::Text::Color(Color::WHITE))
+                    .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(2))),
+            )
+            .spacing(4)
+            .align_x(Alignment::Center);
+        let ghost = container(content).padding(4).width(w).class(cosmic::theme::Container::custom(|_| container::Style {
+            background: Some(Background::Color(Color::from_rgba8(0, 0, 0, 0.45))),
+            border: Border { radius: 6.0.into(), ..Default::default() },
+            ..Default::default()
+        }));
+        Some(pin(ghost).x(d.pos.x - w / 2.0).y(d.pos.y - size as f32 / 2.0 - 4.0).into())
+    }
+
+    // ───────────────────────────── Menús y renombrar ─────────────────────────────
+
+    fn open_menu(&mut self, fid: &str, target: MenuTarget) -> Task<Message> {
+        self.item_drag = None;
+        self.drag = None;
+        let Some(surface) = self.surface_of(fid) else { return Task::none() };
+        let at = self.cursor.get(&surface).copied().unwrap_or(Point::ORIGIN);
+        self.menu = Some(Menu { surface, at, target });
+        self.sync_regions()
+    }
+
+    fn menu_entries(&self, target: &MenuTarget) -> Vec<(&'static str, MenuAction)> {
+        match target {
+            MenuTarget::Fence(fid) => {
+                let Some(f) = self.config.fence(fid) else { return Vec::new() };
+                vec![
+                    ("Renombrar", MenuAction::Rename(fid.clone())),
+                    (if f.rolled_up { "Desenrollar" } else { "Enrollar" }, MenuAction::ToggleRolled(fid.clone())),
+                    (
+                        if f.locked { "Desbloquear posición" } else { "Bloquear posición" },
+                        MenuAction::ToggleLocked(fid.clone()),
+                    ),
+                ]
+            }
+            MenuTarget::Item(fid, path) => {
+                let mut v = vec![("Abrir", MenuAction::Open(path.clone()))];
+                if self.config.fence(fid).is_some_and(|f| !f.is_portal()) {
+                    v.push(("Quitar del fence", MenuAction::RemoveFromFence(fid.clone(), path.clone())));
+                }
+                v
+            }
+        }
+    }
+
+    fn run_menu_action(&mut self, action: MenuAction) -> Task<Message> {
+        match action {
+            MenuAction::Rename(fid) => {
+                let Some(f) = self.config.fence_mut(&fid) else { return Task::none() };
+                // Para renombrar hace falta ver el título: desenrollar no es necesario, el título siempre se ve.
+                let text = f.title.clone();
+                self.renaming = Some(Rename { fence: fid, text });
+                return Task::batch([
+                    widget::text_input::focus(RENAME_INPUT.clone()),
+                    widget::text_input::select_all(RENAME_INPUT.clone()),
+                ]);
+            }
+            MenuAction::ToggleRolled(fid) => return self.toggle_rolled(&fid),
+            MenuAction::ToggleLocked(fid) => {
+                if let Some(f) = self.config.fence_mut(&fid) {
+                    f.locked = !f.locked;
+                    self.save_soon();
+                }
+            }
+            MenuAction::Open(path) => launch::open(&path),
+            MenuAction::RemoveFromFence(fid, path) => self.remove_from_fence(&fid, &path),
+        }
+        Task::none()
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(r) = self.renaming.take() else { return };
+        let title = r.text.trim();
+        if title.is_empty() {
+            return;
+        }
+        if let Some(f) = self.config.fence_mut(&r.fence)
+            && f.title != title
+        {
+            f.title = title.to_string();
+            self.save_soon();
+        }
+    }
+
+    fn menu_layers<'a>(&'a self, menu: &'a Menu, screen: &Screen) -> Vec<Element<'a, Message>> {
+        let entries = self.menu_entries(&menu.target);
+        let h = entries.len() as f32 * MENU_ITEM_HEIGHT + 8.0;
+        let x = menu.at.x.min(screen.width as f32 - MENU_WIDTH).max(0.0);
+        let y = menu.at.y.min(screen.height as f32 - h).max(0.0);
+
+        // Capa invisible que cierra el menú al hacer clic fuera de él.
+        let catcher = widget::mouse_area(container(widget::space::horizontal()).width(Length::Fill).height(Length::Fill))
+            .on_press(Message::CloseMenu)
+            .on_right_press(Message::CloseMenu);
+
+        let buttons: Vec<Element<'a, Message>> = entries
+            .into_iter()
+            .map(|(label, action)| {
+                widget::button::custom(widget::text(label).size(14))
+                    .padding([8, 12])
+                    .width(Length::Fill)
+                    .class(cosmic::theme::Button::MenuItem)
+                    .on_press(Message::Menu(action))
+                    .into()
+            })
+            .collect();
+        let list = container(widget::column::with_children(buttons).padding(4).width(MENU_WIDTH))
+            .class(cosmic::theme::Container::Dropdown);
+
+        vec![catcher.into(), pin(list).x(x).y(y).into()]
     }
 
     // ───────────────────────────── Elementos ─────────────────────────────
@@ -545,17 +881,18 @@ impl App {
         true
     }
 
-    /// Los elementos nuevos del escritorio van al fence cuya regla coincida, o al fence predeterminado.
+    /// Los elementos que aparecen nuevos en el escritorio van al fence cuya regla coincida, o al
+    /// predeterminado. Lo que el usuario sacó de un fence no se vuelve a meter: ya era conocido.
     fn add_new_desktop_items(&mut self) {
-        if !self.config.settings.auto_add_new_items {
+        let current: HashSet<PathBuf> = scan::list_dir(&self.desktop).into_iter().collect();
+        let mut new: Vec<PathBuf> = current.difference(&self.desktop_known).cloned().collect();
+        self.desktop_known = current;
+        if !self.config.settings.auto_add_new_items || new.is_empty() {
             return;
         }
         let fenced = self.config.fenced_paths();
-        let new: Vec<PathBuf> =
-            scan::list_dir(&self.desktop).into_iter().filter(|p| !fenced.contains(p)).collect();
-        if new.is_empty() {
-            return;
-        }
+        new.retain(|p| !fenced.contains(p));
+        new.sort();
         for p in new {
             let Some(item) = scan::item_for(&p) else { continue };
             let target = self
@@ -673,17 +1010,25 @@ impl App {
         (bg, fg)
     }
 
-    fn fence_view<'a>(&'a self, f: &'a FenceModel) -> Element<'a, Message> {
-        let (bg, fg) = self.fence_colors(f);
-        let w = f.width as f32;
-        let h = if f.rolled_up { HEADER_HEIGHT } else { f.height } as f32;
-        let fixed = f.locked || self.config.settings.lock_all;
+    fn header_view<'a>(&'a self, f: &'a FenceModel, fg: Color, fixed: bool) -> Element<'a, Message> {
+        if let Some(r) = self.renaming.as_ref().filter(|r| r.fence == f.id) {
+            let input = widget::text_input("Nombre del fence", r.text.as_str())
+                .id(RENAME_INPUT.clone())
+                .on_input(Message::RenameInput)
+                .on_submit(|_| Message::RenameSubmit);
+            return container(input)
+                .padding([2, 8])
+                .width(Length::Fill)
+                .height(HEADER_HEIGHT as f32)
+                .align_y(Alignment::Center)
+                .into();
+        }
 
         let title = widget::text(f.title.as_str())
             .size(14)
             .class(cosmic::theme::Text::Color(fg))
             .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(1)));
-        let header = widget::mouse_area(
+        widget::mouse_area(
             container(title)
                 .padding([0, 12])
                 .width(Length::Fill)
@@ -692,10 +1037,20 @@ impl App {
                 .align_x(Alignment::Center),
         )
         .on_press(Message::HeaderPressed(f.id.clone()))
+        .on_right_press(Message::HeaderRightPressed(f.id.clone()))
         .on_double_click(Message::ToggleRolled(f.id.clone()))
-        .interaction(if fixed { mouse::Interaction::Idle } else { mouse::Interaction::Grab });
+        .interaction(if fixed { mouse::Interaction::Idle } else { mouse::Interaction::Grab })
+        .into()
+    }
 
-        let mut column = widget::column::with_capacity(3).push(header);
+    fn fence_view<'a>(&'a self, f: &'a FenceModel) -> Element<'a, Message> {
+        let (bg, fg) = self.fence_colors(f);
+        let w = f.width as f32;
+        let h = if f.rolled_up { HEADER_HEIGHT } else { f.height } as f32;
+        let fixed = f.locked || self.config.settings.lock_all;
+        let is_drop_target = self.drop_target().is_some_and(|t| t.id == f.id);
+
+        let mut column = widget::column::with_capacity(3).push(self.header_view(f, fg, fixed));
         if !f.rolled_up {
             column = column
                 .push(container(widget::space::horizontal()).height(1.0).width(Length::Fill).class(
@@ -707,15 +1062,19 @@ impl App {
                 .push(self.items_view(f, fg));
         }
 
-        let body = container(column)
-            .width(w)
-            .height(h)
-            .class(cosmic::theme::Container::custom(move |_| container::Style {
+        let border = if is_drop_target {
+            Border { radius: 10.0.into(), width: 2.0, color: Color { a: 0.85, ..fg } }
+        } else {
+            Border { radius: 10.0.into(), width: 1.0, color: Color { a: 0.12, ..fg } }
+        };
+        let body = container(column).width(w).height(h).class(cosmic::theme::Container::custom(move |_| {
+            container::Style {
                 background: Some(Background::Color(bg)),
-                border: Border { radius: 10.0.into(), width: 1.0, color: Color { a: 0.12, ..fg } },
+                border,
                 text_color: Some(fg),
                 ..Default::default()
-            }));
+            }
+        }));
 
         if fixed {
             return body.into();
@@ -757,21 +1116,24 @@ impl App {
         let entries = self.entries.get(&f.id).map(Vec::as_slice).unwrap_or_default();
 
         if entries.is_empty() {
-            let hint = if f.is_portal() { "Carpeta vacía" } else { "Vacío" };
+            let hint = if f.is_portal() { "Carpeta vacía" } else { "Arrastra elementos aquí" };
             return container(widget::text(hint).size(12).class(cosmic::theme::Text::Color(Color { a: 0.6, ..fg })))
                 .center(Length::Fill)
                 .into();
         }
 
+        let dragging = self.item_drag.as_ref().filter(|d| d.active).map(|d| d.path.as_path());
         let tiles: Vec<Element<'a, Message>> = entries
             .iter()
             .map(|e| {
                 let selected = self.selected.as_deref() == Some(e.item.path.as_path());
+                // El elemento que se está arrastrando se atenúa en su sitio.
+                let alpha = if dragging == Some(e.item.path.as_path()) { 0.35 } else { 1.0 };
                 let label = widget::text(e.item.name.as_str())
                     .size(12)
                     .width(Length::Fill)
                     .align_x(Alignment::Center)
-                    .class(cosmic::theme::Text::Color(fg))
+                    .class(cosmic::theme::Text::Color(Color { a: alpha, ..fg }))
                     .ellipsize(Ellipsize::End(EllipsizeHeightLimit::Lines(2)));
                 let content = widget::column::with_capacity(2)
                     .push(widget::icon(e.icon.clone()).size(size))
@@ -787,7 +1149,8 @@ impl App {
                     },
                 ));
                 widget::mouse_area(tile)
-                    .on_press(Message::Select(e.item.path.clone()))
+                    .on_press(Message::ItemPressed(f.id.clone(), e.item.path.clone()))
+                    .on_right_press(Message::ItemRightPressed(f.id.clone(), e.item.path.clone()))
                     .on_double_click(Message::Open(e.item.path.clone()))
                     .into()
             })
