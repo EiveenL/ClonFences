@@ -3,6 +3,7 @@
 //! y la región de entrada se limita a sus rectángulos, así el resto de clics llegan al escritorio de abajo.
 //! Mientras hay un menú abierto o se arrastra un elemento, la superficie acepta toda la entrada.
 
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -11,6 +12,8 @@ use std::time::{Duration, Instant, SystemTime};
 use cosmic::app::{Core, Task};
 use cosmic::cctk::wayland_client::Proxy;
 use cosmic::cctk::wayland_client::protocol::wl_output::WlOutput;
+use cosmic::iced::clipboard::dnd::DndAction;
+use cosmic::iced::clipboard::mime::AllowedMimeTypes;
 use cosmic::iced::core::text::{Ellipsize, EllipsizeHeightLimit};
 use cosmic::iced::event::wayland::{Event as WaylandEvent, OutputEvent};
 use cosmic::iced::platform_specific::runtime::wayland::layer_surface::{
@@ -43,6 +46,23 @@ const MENU_WIDTH: f32 = 230.0;
 const MENU_ITEM_HEIGHT: f32 = 36.0;
 
 static RENAME_INPUT: LazyLock<widget::Id> = LazyLock::new(|| widget::Id::new("clonfences-rename"));
+
+/// Archivos que llegan arrastrados desde otra aplicación (el escritorio de COSMIC, Archivos…).
+#[derive(Debug, Clone)]
+struct DroppedPaths(Vec<PathBuf>);
+
+impl AllowedMimeTypes for DroppedPaths {
+    fn allowed() -> Cow<'static, [String]> {
+        Cow::Owned(vec!["text/uri-list".to_string()])
+    }
+}
+
+impl TryFrom<(Vec<u8>, String)> for DroppedPaths {
+    type Error = std::str::Utf8Error;
+    fn try_from((data, _mime): (Vec<u8>, String)) -> Result<Self, Self::Error> {
+        Ok(Self(crate::model::uri::parse_uri_list(std::str::from_utf8(&data)?)))
+    }
+}
 
 pub struct Flags {
     pub config: AppConfig,
@@ -139,6 +159,10 @@ pub enum Message {
     CloseMenu,
     RenameInput(String),
     RenameSubmit,
+    /// Un arrastre externo entra en un fence (Some) o sale (None).
+    DndHover(Option<String>),
+    /// Se soltaron archivos de otra aplicación sobre un fence.
+    DropFiles(String, Vec<PathBuf>),
     Escape,
     Tick,
     /// SIGINT/SIGTERM/SIGHUP: restaurar el escritorio, guardar y salir.
@@ -155,6 +179,8 @@ pub struct App {
     item_drag: Option<ItemDrag>,
     menu: Option<Menu>,
     renaming: Option<Rename>,
+    /// Fence sobre el que hay un arrastre externo en curso.
+    dnd_hover: Option<String>,
     cursor: HashMap<window::Id, Point>,
     selected: Option<PathBuf>,
     /// Entradas del escritorio ya vistas: sólo las nuevas se añaden solas a un fence.
@@ -193,6 +219,7 @@ impl Application for App {
             item_drag: None,
             menu: None,
             renaming: None,
+            dnd_hover: None,
             cursor: HashMap::new(),
             selected: None,
             dir_stamps: HashMap::new(),
@@ -305,6 +332,12 @@ impl Application for App {
             }
             Message::RenameSubmit => self.commit_rename(),
 
+            Message::DndHover(fid) => self.dnd_hover = fid,
+            Message::DropFiles(fid, paths) => {
+                self.dnd_hover = None;
+                self.add_to_fence(&fid, paths);
+            }
+
             Message::Escape => {
                 if self.renaming.take().is_none() && self.menu.take().is_none() {
                     self.selected = None;
@@ -346,7 +379,7 @@ impl Application for App {
         };
         let mut layers: Vec<Element<'_, Message>> = self
             .fences_on(screen)
-            .map(|f| pin(self.fence_view(f)).x(f.x as f32).y(f.y as f32).into())
+            .map(|f| pin(self.droppable(f)).x(f.x as f32).y(f.y as f32).into())
             .collect();
         if let Some(ghost) = self.drag_ghost(id) {
             layers.push(ghost);
@@ -644,18 +677,42 @@ impl App {
     }
 
     fn move_to_fence(&mut self, path: &Path, target: &str) {
-        let key = path.to_string_lossy().into_owned();
-        let mut touched = Vec::new();
-        for f in self.config.fences.iter_mut().filter(|f| !f.is_portal()) {
+        self.add_to_fence(target, vec![path.to_path_buf()]);
+    }
+
+    /// Mete elementos en un fence normal (quitándolos de cualquier otro fence). Los archivos no se mueven:
+    /// el fence guarda una referencia; si están en el escritorio, dejan de verse en él.
+    fn add_to_fence(&mut self, target: &str, paths: Vec<PathBuf>) {
+        if self.config.fence(target).is_none_or(|f| f.is_portal()) {
+            return;
+        }
+        let keys: Vec<String> = paths
+            .iter()
+            .filter(|p| p.exists())
+            .map(|p| p.to_string_lossy().into_owned())
+            .fold(Vec::new(), |mut v, k| {
+                if !v.contains(&k) {
+                    v.push(k);
+                }
+                v
+            });
+        if keys.is_empty() {
+            return;
+        }
+        let mut touched = vec![target.to_string()];
+        for f in self.config.fences.iter_mut().filter(|f| !f.is_portal() && f.id != target) {
             let before = f.items.len();
-            f.items.retain(|p| *p != key);
+            f.items.retain(|p| !keys.contains(p));
             if f.items.len() != before {
                 touched.push(f.id.clone());
             }
         }
         if let Some(t) = self.config.fence_mut(target) {
-            t.items.push(key);
-            touched.push(target.to_string());
+            for k in keys {
+                if !t.items.contains(&k) {
+                    t.items.push(k);
+                }
+            }
         }
         for id in touched {
             self.reload_fence(&id);
@@ -1043,12 +1100,30 @@ impl App {
         .into()
     }
 
+    /// El fence acepta archivos arrastrados desde otras aplicaciones (sólo los fences normales).
+    fn droppable<'a>(&'a self, f: &'a FenceModel) -> Element<'a, Message> {
+        if f.is_portal() {
+            return self.fence_view(f);
+        }
+        let (drop_id, enter_id) = (f.id.clone(), f.id.clone());
+        widget::DndDestination::for_data::<DroppedPaths>(self.fence_view(f), move |data, _action| {
+            Message::DropFiles(drop_id.clone(), data.map(|d| d.0).unwrap_or_default())
+        })
+        // Sólo "copiar": el fence guarda una referencia y el origen no debe borrar ni mover nada.
+        .action(DndAction::Copy)
+        .preferred_action(DndAction::Copy)
+        .on_enter(move |_, _, _| Message::DndHover(Some(enter_id.clone())))
+        .on_leave(|| Message::DndHover(None))
+        .into()
+    }
+
     fn fence_view<'a>(&'a self, f: &'a FenceModel) -> Element<'a, Message> {
         let (bg, fg) = self.fence_colors(f);
         let w = f.width as f32;
         let h = if f.rolled_up { HEADER_HEIGHT } else { f.height } as f32;
         let fixed = f.locked || self.config.settings.lock_all;
-        let is_drop_target = self.drop_target().is_some_and(|t| t.id == f.id);
+        let is_drop_target = self.drop_target().is_some_and(|t| t.id == f.id)
+            || self.dnd_hover.as_deref() == Some(f.id.as_str());
 
         let mut column = widget::column::with_capacity(3).push(self.header_view(f, fg, fixed));
         if !f.rolled_up {

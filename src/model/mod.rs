@@ -5,3 +5,4 @@ pub mod config;
 pub mod geometry;
 pub mod item;
 pub mod rules;
+pub mod uri;
