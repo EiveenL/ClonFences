@@ -1,5 +1,6 @@
 //! Integración con Linux/freedesktop: rutas XDG, archivos, lanzadores, registro.
 
+pub mod autostart;
 pub mod desktop_entry;
 pub mod hidden;
 pub mod icons;

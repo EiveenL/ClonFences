@@ -172,6 +172,12 @@ pub struct App {
     save_due: Option<Instant>,
     /// Último conjunto de nombres aplicado a `~/Escritorio/.hidden` (None = volver a comprobar).
     hidden_synced: Option<BTreeSet<String>>,
+    /// Se desconectó algún monitor desde el arranque.
+    output_lost: bool,
+    /// Cuándo reiniciar el proceso. Si un monitor se desconecta y vuelve (al apagarlo o al cambiar la
+    /// entrada a otro equipo), la superficie que se crea para él se dibuja pero no recibe clics; un
+    /// proceso nuevo sí funciona.
+    restart_at: Option<Instant>,
 }
 
 impl Application for App {
@@ -207,6 +213,8 @@ impl Application for App {
             dir_stamps: HashMap::new(),
             save_due: None,
             hidden_synced: None,
+            output_lost: false,
+            restart_at: None,
         };
         app.dir_stamps.insert(app.desktop.clone(), scan::dir_stamp(&app.desktop));
         let ids: Vec<String> = app.config.fences.iter().map(|f| f.id.clone()).collect();
@@ -232,6 +240,7 @@ impl Application for App {
                     self.clamp_fences();
                     return self.sync_regions();
                 }
+                log(format!("Tamaño {w}x{h} de una superficie desconocida ({id:?})"));
             }
 
             Message::CursorMoved(id, p) => {
@@ -339,6 +348,11 @@ impl Application for App {
             }
 
             Message::Tick => {
+                if self.restart_at.is_some_and(|t| Instant::now() >= t) {
+                    self.restart_at = None;
+                    self.save_now();
+                    restart_process();
+                }
                 let mut task = Task::none();
                 if self.refresh_changed_dirs() {
                     self.hidden_synced = None;
@@ -450,6 +464,21 @@ fn quit_signals() -> impl cosmic::iced::futures::Stream<Item = Message> {
     })
 }
 
+/// Sustituye el proceso por uno nuevo del mismo ejecutable con los mismos argumentos. El bloqueo de
+/// instancia única se libera solo: su descriptor se cierra en el `exec`.
+fn restart_process() {
+    use std::os::unix::process::CommandExt;
+    let Ok(exe) = std::env::current_exe() else {
+        log("No se pudo reiniciar: ejecutable desconocido");
+        return;
+    };
+    // Si se reinstaló mientras corría, Linux añade " (deleted)" a la ruta del antiguo.
+    let exe = PathBuf::from(exe.to_string_lossy().trim_end_matches(" (deleted)"));
+    let args = std::env::args().skip(1).filter(|a| a != "--reset");
+    let err = std::process::Command::new(&exe).args(args).exec();
+    log(format!("No se pudo reiniciar {}: {err}", exe.display()));
+}
+
 impl App {
     // ───────────────────────────── Monitores ─────────────────────────────
 
@@ -467,6 +496,11 @@ impl App {
                 let surface = window::Id::unique();
                 log(format!("Monitor {name}: {width}x{height}"));
                 self.screens.push(Screen { surface, output: output.clone(), name, width, height });
+                if self.output_lost {
+                    // Margen por si el monitor parpadea varias veces al encenderse.
+                    log("Monitor reconectado: reiniciando en 2 s");
+                    self.restart_at = Some(Instant::now() + Duration::from_secs(2));
+                }
 
                 let settings = SctkLayerSurfaceSettings {
                     id: surface,
@@ -495,6 +529,8 @@ impl App {
                 };
                 let s = self.screens.remove(pos);
                 log(format!("Monitor {} desconectado", s.name));
+                self.output_lost = true;
+                self.restart_at = None;
                 if self.menu.as_ref().is_some_and(|m| m.surface == s.surface) {
                     self.menu = None;
                 }
