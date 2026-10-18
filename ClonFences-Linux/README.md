@@ -1,8 +1,8 @@
-# Clon Fences para COSMIC
+# Cercado para Linux (Clon Fences para COSMIC)
 
 Versión para Linux (Pop!_OS con COSMIC, Wayland) de Clon Fences, el organizador de escritorio inspirado en Stardock Fences.
 Es una reescritura en Rust con [libcosmic](https://github.com/pop-os/libcosmic); la versión de Windows (C#/WPF)
-sigue en su propio repositorio.
+está en [`../ClonFences`](../ClonFences). Guía completa de despliegue en el [README principal](../README.md).
 
 ## Ejecutar
 
